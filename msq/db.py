@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-from msq.models import DatabaseInfo, EmailDetail, EmailResult
+from msq.models import DatabaseInfo, DatabaseStats, EmailDetail, EmailResult
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -275,4 +275,41 @@ def get_email(
         body=row["body_fld"] or "",
         cc=row["cc_fld"] or "",
         bcc=row["bcc_fld"] or "",
+    )
+
+
+def get_stats(conn: sqlite3.Connection, schema: str) -> DatabaseStats:
+    """Berechnet Statistiken fuer eine MailSteward-Datenbank.
+
+    Args:
+        conn: Offene Datenbankverbindung
+        schema: Schema-Typ ('modern' oder 'legacy')
+
+    Returns:
+        DatabaseStats mit Mailbox-, Sender- und Datumsverteilung
+    """
+    mailbox_counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT mailbox_fld, COUNT(*) AS cnt FROM mail GROUP BY mailbox_fld"
+    ):
+        mailbox_counts[row["mailbox_fld"] or "(empty)"] = row["cnt"]
+
+    sender_counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT from_fld, COUNT(*) AS cnt FROM mail "
+        "GROUP BY from_fld ORDER BY cnt DESC LIMIT 20"
+    ):
+        sender_counts[row["from_fld"] or "(empty)"] = row["cnt"]
+
+    date_distribution: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT strftime('%Y-%m', datesent_fld) AS period, COUNT(*) AS cnt "
+        "FROM mail GROUP BY period"
+    ):
+        date_distribution[row["period"] or "(unknown)"] = row["cnt"]
+
+    return DatabaseStats(
+        mailbox_counts=mailbox_counts,
+        sender_counts=sender_counts,
+        date_distribution=date_distribution,
     )

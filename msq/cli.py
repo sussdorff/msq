@@ -1,18 +1,25 @@
 """CLI entry point for msq."""
 
+from pathlib import Path
+
 import typer
 
 from msq import __version__
+from msq.attachments import extract_attachment, list_attachments
 from msq.config import load_config, resolve_db
-from msq.db import detect_schema, discover_databases, get_email, open_db, search_emails
+from msq.db import detect_schema, discover_databases, get_email, get_stats, open_db, search_emails
 from msq.output import (
     OutputFormat,
+    output_attachments,
     output_databases,
     output_email_detail,
     output_emails,
+    output_stats,
     print_error,
     print_info,
+    print_success,
 )
+from msq.parallel import search_all_databases
 
 app = typer.Typer(
     name="msq",
@@ -95,27 +102,18 @@ def search(
         if not databases:
             print_info("No databases found.")
             raise typer.Exit()
-        results = []
-        for db_info in databases:
-            conn = open_db(db_info.path)
-            try:
-                schema = detect_schema(conn)
-                results.extend(
-                    search_emails(
-                        conn, schema,
-                        query=query,
-                        from_filter=from_filter,
-                        to_filter=to_filter,
-                        subject_filter=subject,
-                        body_filter=body,
-                        date_from=date_from,
-                        date_to=date_to,
-                        has_attachments=has_attachments or None,
-                        limit=limit,
-                    )
-                )
-            finally:
-                conn.close()
+        results = search_all_databases(
+            databases,
+            query=query,
+            from_filter=from_filter,
+            to_filter=to_filter,
+            subject_filter=subject,
+            body_filter=body,
+            date_from=date_from,
+            date_to=date_to,
+            has_attachments=has_attachments or None,
+            limit=limit,
+        )
 
     if not results:
         print_info("No results found.")
@@ -147,3 +145,89 @@ def show(
         raise typer.Exit(1)
 
     output_email_detail(email)
+
+
+@app.command()
+def attachments(
+    db_name: str = typer.Argument(..., help="Database name or alias."),
+    email_id: int = typer.Argument(..., help="Email ID."),
+    fmt: OutputFormat = typer.Option(OutputFormat.TABLE, "--format", "-f", help="Output format."),
+) -> None:
+    """List attachments of an email."""
+    config = load_config()
+    db_path = resolve_db(config, db_name)
+    if db_path is None:
+        print_error(f"Database not found: {db_name}")
+        raise typer.Exit(1)
+
+    conn = open_db(db_path)
+    try:
+        schema = detect_schema(conn)
+        atts = list_attachments(conn, schema, email_id)
+    finally:
+        conn.close()
+
+    if not atts:
+        print_info("No attachments found.")
+        raise typer.Exit()
+
+    output_attachments(atts, fmt)
+
+
+@app.command()
+def extract(
+    db_name: str = typer.Argument(..., help="Database name or alias."),
+    email_id: int = typer.Argument(..., help="Email ID."),
+    output_dir: Path = typer.Option(Path("."), "--output", "-o", help="Output directory."),
+    index: int | None = typer.Option(
+        None, "--index", "-i", help="Extract specific attachment index (0-based).",
+    ),
+) -> None:
+    """Extract attachments from an email."""
+    config = load_config()
+    db_path = resolve_db(config, db_name)
+    if db_path is None:
+        print_error(f"Database not found: {db_name}")
+        raise typer.Exit(1)
+
+    conn = open_db(db_path)
+    try:
+        schema = detect_schema(conn)
+        atts = list_attachments(conn, schema, email_id)
+        if not atts:
+            print_error("No attachments found.")
+            raise typer.Exit(1)
+
+        if index is not None:
+            if index < 0 or index >= len(atts):
+                print_error(f"Index {index} out of range (0-{len(atts) - 1}).")
+                raise typer.Exit(1)
+            path = extract_attachment(conn, schema, email_id, index, output_dir)
+            print_success(f"Extracted: {path}")
+        else:
+            for i in range(len(atts)):
+                path = extract_attachment(conn, schema, email_id, i, output_dir)
+                print_success(f"Extracted: {path}")
+    finally:
+        conn.close()
+
+
+@app.command()
+def stats(
+    db_name: str = typer.Argument(..., help="Database name or alias."),
+) -> None:
+    """Show database statistics."""
+    config = load_config()
+    db_path = resolve_db(config, db_name)
+    if db_path is None:
+        print_error(f"Database not found: {db_name}")
+        raise typer.Exit(1)
+
+    conn = open_db(db_path)
+    try:
+        schema = detect_schema(conn)
+        db_stats = get_stats(conn, schema)
+    finally:
+        conn.close()
+
+    output_stats(db_stats)
