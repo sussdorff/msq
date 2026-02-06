@@ -1,7 +1,6 @@
 """Tests fuer msq.output."""
 
 import json
-from io import StringIO
 from pathlib import Path
 
 from msq.models import AttachmentInfo, DatabaseInfo, DatabaseStats, EmailDetail, EmailResult

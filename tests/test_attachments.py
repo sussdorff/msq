@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from msq.attachments import extract_attachment, list_attachments
+from msq.db import detect_schema
 
 
 @pytest.fixture
@@ -13,6 +14,7 @@ def legacy_db_with_attachments():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("""CREATE TABLE mail (
+        emailid INTEGER PRIMARY KEY,
         from_fld TEXT, to_fld TEXT, subject_fld TEXT,
         datesent_fld TEXT, body_fld TEXT, mailbox_fld TEXT
     )""")
@@ -20,7 +22,7 @@ def legacy_db_with_attachments():
         mail_fld INTEGER, filename_fld BLOB, attach_fld BLOB, filesize_fld INTEGER
     )""")
     conn.execute(
-        "INSERT INTO mail VALUES ('a@b.com','c@d.com','Test','2024-01-01','Body','INBOX')"
+        "INSERT INTO mail VALUES (1, 'a@b.com','c@d.com','Test','2024-01-01','Body','INBOX')"
     )
     # test.txt mit Inhalt "Hello"
     conn.execute(
@@ -36,32 +38,36 @@ def legacy_db_with_attachments():
 
 @pytest.fixture
 def modern_db_with_attachments():
-    """Modern-Schema DB mit Attachments (TEXT name, emailid)."""
+    """Modern-Schema DB mit Attachments (echtes MailSteward 'email' + 'attachments')."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.execute("""CREATE TABLE mail (
-        emailid INTEGER PRIMARY KEY,
-        from_fld TEXT, to_fld TEXT, subject_fld TEXT,
-        datesent_fld TEXT, body_fld TEXT, mailbox_fld TEXT
+    conn.execute("""CREATE TABLE email (
+        id INTEGER PRIMARY KEY,
+        from_fld TEXT, to_fld TEXT, subj_fld TEXT,
+        date_fld TEXT, body_fld TEXT, mailbox TEXT
     )""")
-    conn.execute("""CREATE TABLE attachdata (
-        emailid INTEGER, name TEXT, data BLOB, filesize INTEGER
+    conn.execute("""CREATE TABLE attachments (
+        id INTEGER, type_fld TEXT, filename_fld TEXT,
+        encode_fld INTEGER DEFAULT 0, attach_fld BLOB
     )""")
     conn.execute(
-        "INSERT INTO mail VALUES (1,'a@b.com','c@d.com','Test','2024-01-01','Body','INBOX')"
+        "INSERT INTO email VALUES (1,'a@b.com','c@d.com','Test','2024-01-01','Body','INBOX')"
     )
     conn.execute(
-        "INSERT INTO mail VALUES (2,'x@y.com','z@w.com','Other','2024-02-01','Body2','INBOX')"
+        "INSERT INTO email VALUES (2,'x@y.com','z@w.com','Other','2024-02-01','Body2','INBOX')"
     )
-    # report.pdf (5 Bytes) fuer emailid=1
-    conn.execute("INSERT INTO attachdata VALUES (1, 'report.pdf', X'255044462D', 5)")
+    # report.pdf (5 Bytes) fuer id=1
+    conn.execute(
+        "INSERT INTO attachments VALUES (1, 'application/pdf', 'report.pdf', 0, X'255044462D')"
+    )
     conn.commit()
     return conn
 
 
 class TestListAttachments:
     def test_legacy_lists_attachments(self, legacy_db_with_attachments):
-        result = list_attachments(legacy_db_with_attachments, "legacy", 1)
+        schema = detect_schema(legacy_db_with_attachments)
+        result = list_attachments(legacy_db_with_attachments, schema, 1)
         assert len(result) == 2
         assert result[0].filename == "test.txt"
         assert result[0].size == 5
@@ -69,51 +75,57 @@ class TestListAttachments:
         assert result[1].size == 6
 
     def test_modern_lists_attachments(self, modern_db_with_attachments):
-        result = list_attachments(modern_db_with_attachments, "modern", 1)
+        schema = detect_schema(modern_db_with_attachments)
+        result = list_attachments(modern_db_with_attachments, schema, 1)
         assert len(result) == 1
         assert result[0].filename == "report.pdf"
-        assert result[0].size == 5
 
     def test_legacy_no_attachments(self, legacy_db_with_attachments):
-        """Email ohne Attachments liefert leere Liste."""
-        result = list_attachments(legacy_db_with_attachments, "legacy", 999)
+        schema = detect_schema(legacy_db_with_attachments)
+        result = list_attachments(legacy_db_with_attachments, schema, 999)
         assert result == []
 
     def test_modern_no_attachments(self, modern_db_with_attachments):
-        """Email ohne Attachments liefert leere Liste."""
-        result = list_attachments(modern_db_with_attachments, "modern", 2)
+        schema = detect_schema(modern_db_with_attachments)
+        result = list_attachments(modern_db_with_attachments, schema, 2)
         assert result == []
 
     def test_attachment_has_rowid(self, modern_db_with_attachments):
-        result = list_attachments(modern_db_with_attachments, "modern", 1)
+        schema = detect_schema(modern_db_with_attachments)
+        result = list_attachments(modern_db_with_attachments, schema, 1)
         assert result[0].id > 0
 
 
 class TestExtractAttachment:
     def test_legacy_extract(self, legacy_db_with_attachments, tmp_path):
-        path = extract_attachment(legacy_db_with_attachments, "legacy", 1, 0, tmp_path)
+        schema = detect_schema(legacy_db_with_attachments)
+        path = extract_attachment(legacy_db_with_attachments, schema, 1, 0, tmp_path)
         assert path == tmp_path / "test.txt"
         assert path.read_bytes() == b"Hello"
 
     def test_legacy_extract_second(self, legacy_db_with_attachments, tmp_path):
-        path = extract_attachment(legacy_db_with_attachments, "legacy", 1, 1, tmp_path)
+        schema = detect_schema(legacy_db_with_attachments)
+        path = extract_attachment(legacy_db_with_attachments, schema, 1, 1, tmp_path)
         assert path == tmp_path / "notes.md"
         assert path.read_bytes() == b"World!"
 
     def test_modern_extract(self, modern_db_with_attachments, tmp_path):
-        path = extract_attachment(modern_db_with_attachments, "modern", 1, 0, tmp_path)
+        schema = detect_schema(modern_db_with_attachments)
+        path = extract_attachment(modern_db_with_attachments, schema, 1, 0, tmp_path)
         assert path == tmp_path / "report.pdf"
         assert path.read_bytes() == b"%PDF-"
 
     def test_index_out_of_range(self, modern_db_with_attachments, tmp_path):
+        schema = detect_schema(modern_db_with_attachments)
         with pytest.raises(IndexError, match="ausserhalb"):
-            extract_attachment(modern_db_with_attachments, "modern", 1, 5, tmp_path)
+            extract_attachment(modern_db_with_attachments, schema, 1, 5, tmp_path)
 
     def test_null_data_raises(self, modern_db_with_attachments, tmp_path):
         """Attachment mit NULL data wirft ValueError."""
         modern_db_with_attachments.execute(
-            "INSERT INTO attachdata VALUES (1, 'empty.bin', NULL, 0)"
+            "INSERT INTO attachments VALUES (1, 'text/plain', 'empty.bin', 0, NULL)"
         )
         modern_db_with_attachments.commit()
+        schema = detect_schema(modern_db_with_attachments)
         with pytest.raises(ValueError, match="NULL"):
-            extract_attachment(modern_db_with_attachments, "modern", 1, 1, tmp_path)
+            extract_attachment(modern_db_with_attachments, schema, 1, 1, tmp_path)

@@ -1,9 +1,29 @@
 """Datenbankzugriff fuer MailSteward SQLite-Archive."""
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from msq.models import DatabaseInfo, DatabaseStats, EmailDetail, EmailResult
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaMapping:
+    """Mapping der logischen Spaltennamen auf die tatsaechlichen Spaltennamen."""
+
+    table: str
+    id_col: str
+    from_col: str
+    to_col: str
+    subject_col: str
+    date_col: str
+    mailbox_col: str
+    body_col: str
+    attach_table: str
+    attach_fk_col: str
+    attach_filename_col: str
+    attach_data_col: str
+    attach_size_col: str | None
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -20,17 +40,126 @@ def open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def detect_schema(conn: sqlite3.Connection) -> str:
-    """Erkennt das Schema-Format der Datenbank.
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Holt Spaltennamen einer Tabelle."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def detect_schema(conn: sqlite3.Connection) -> SchemaMapping:
+    """Erkennt das Schema-Format und gibt ein Mapping zurueck.
+
+    Unterstuetzt verschiedene MailSteward-Schema-Varianten:
+    - Modern: Tabelle 'email' mit id, subj_fld, date_fld, mailbox
+    - Legacy: Tabelle 'mail' mit emailid/rowid, subject_fld, datesent_fld, mailbox_fld
 
     Args:
         conn: Offene Datenbankverbindung
 
     Returns:
-        'modern' wenn emailid-Spalte existiert, sonst 'legacy'
+        SchemaMapping mit den tatsaechlichen Spaltennamen
     """
-    columns = [row["name"] for row in conn.execute("PRAGMA table_info(mail)")]
-    return "modern" if "emailid" in columns else "legacy"
+    # Email-Tabelle erkennen
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+
+    if "email" in tables:
+        email_table = "email"
+    elif "mail" in tables:
+        email_table = "mail"
+    else:
+        msg = "Keine bekannte Email-Tabelle gefunden (weder 'email' noch 'mail')"
+        raise ValueError(msg)
+
+    cols = _get_table_columns(conn, email_table)
+
+    # ID-Spalte
+    if "id" in cols:
+        id_col = "id"
+    elif "emailid" in cols:
+        id_col = "emailid"
+    else:
+        id_col = "rowid"
+
+    # Subject-Spalte
+    subject_col = "subj_fld" if "subj_fld" in cols else "subject_fld"
+
+    # Date-Spalte
+    date_col = "date_fld" if "date_fld" in cols else "datesent_fld"
+
+    # Mailbox-Spalte
+    mailbox_col = "mailbox" if "mailbox" in cols else "mailbox_fld"
+
+    # Body-Spalte (immer body_fld in beiden Schemas)
+    body_col = "body_fld"
+
+    # Attachment-Tabelle
+    if "attachments" in tables:
+        attach_table = "attachments"
+    elif "attachdata" in tables:
+        attach_table = "attachdata"
+    else:
+        attach_table = ""
+
+    # Attachment-Spalten ermitteln
+    attach_fk_col = "id"
+    attach_filename_col = "filename_fld"
+    attach_data_col = "attach_fld"
+    attach_size_col: str | None = None
+
+    if attach_table:
+        attach_cols = _get_table_columns(conn, attach_table)
+
+        # FK-Spalte
+        if "id" in attach_cols:
+            attach_fk_col = "id"
+        elif "emailid" in attach_cols:
+            attach_fk_col = "emailid"
+        elif "mail_fld" in attach_cols:
+            attach_fk_col = "mail_fld"
+        elif "message_id" in attach_cols:
+            attach_fk_col = "message_id"
+
+        # Filename-Spalte
+        if "filename_fld" in attach_cols:
+            attach_filename_col = "filename_fld"
+        elif "name" in attach_cols:
+            attach_filename_col = "name"
+
+        # Data-Spalte
+        if "attach_fld" in attach_cols:
+            attach_data_col = "attach_fld"
+        elif "data" in attach_cols:
+            attach_data_col = "data"
+
+        # Size-Spalte
+        if "filesize_fld" in attach_cols:
+            attach_size_col = "filesize_fld"
+        elif "filesize" in attach_cols:
+            attach_size_col = "filesize"
+
+    return SchemaMapping(
+        table=email_table,
+        id_col=id_col,
+        from_col="from_fld",
+        to_col="to_fld",
+        subject_col=subject_col,
+        date_col=date_col,
+        mailbox_col=mailbox_col,
+        body_col=body_col,
+        attach_table=attach_table,
+        attach_fk_col=attach_fk_col,
+        attach_filename_col=attach_filename_col,
+        attach_data_col=attach_data_col,
+        attach_size_col=attach_size_col,
+    )
+
+
+def schema_type_label(schema: SchemaMapping) -> str:
+    """Gibt ein Label fuer den Schema-Typ zurueck."""
+    if schema.table == "email":
+        return "modern"
+    return "legacy"
 
 
 def decode_filename(value: bytes | str) -> str:
@@ -79,11 +208,14 @@ def discover_databases(db_dir: Path) -> list[DatabaseInfo]:
 
         try:
             schema = detect_schema(conn)
-            count_row = conn.execute("SELECT COUNT(*) AS cnt FROM mail").fetchone()
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM {schema.table}"
+            ).fetchone()
             email_count = count_row["cnt"] if count_row else 0
 
             range_row = conn.execute(
-                "SELECT MIN(datesent_fld) AS min_d, MAX(datesent_fld) AS max_d FROM mail"
+                f"SELECT MIN({schema.date_col}) AS min_d, "
+                f"MAX({schema.date_col}) AS max_d FROM {schema.table}"
             ).fetchone()
             date_from = range_row["min_d"] or "" if range_row else ""
             date_to = range_row["max_d"] or "" if range_row else ""
@@ -95,10 +227,10 @@ def discover_databases(db_dir: Path) -> list[DatabaseInfo]:
                     email_count=email_count,
                     date_range=(date_from, date_to),
                     size_bytes=entry.stat().st_size,
-                    schema_type=schema,
+                    schema_type=schema_type_label(schema),
                 )
             )
-        except sqlite3.Error:
+        except (sqlite3.Error, ValueError):
             continue
         finally:
             conn.close()
@@ -109,7 +241,7 @@ def discover_databases(db_dir: Path) -> list[DatabaseInfo]:
 
 def search_emails(
     conn: sqlite3.Connection,
-    schema: str,
+    schema: SchemaMapping,
     *,
     query: str | None = None,
     from_filter: str | None = None,
@@ -125,7 +257,7 @@ def search_emails(
 
     Args:
         conn: Offene Datenbankverbindung
-        schema: Schema-Typ ('modern' oder 'legacy')
+        schema: Schema-Mapping
         query: Allgemeine Suche in from/to/subject
         from_filter: Filter fuer Absender
         to_filter: Filter fuer Empfaenger
@@ -139,62 +271,64 @@ def search_emails(
     Returns:
         Liste von EmailResult-Objekten
     """
-    id_col = "emailid" if schema == "modern" else "rowid"
+    t = schema.table
+    s = schema
 
     select = (
-        f"SELECT m.{id_col} AS id, m.from_fld, m.to_fld, "
-        "m.subject_fld, m.datesent_fld, m.mailbox_fld"
+        f"SELECT m.{s.id_col} AS id, m.{s.from_col}, m.{s.to_col}, "
+        f"m.{s.subject_col}, m.{s.date_col}, m.{s.mailbox_col}"
     )
-    from_clause = " FROM mail m"
+    from_clause = f" FROM {t} m"
     conditions: list[str] = []
     params: list[str] = []
 
     if query:
         conditions.append(
-            "(m.from_fld LIKE ? OR m.to_fld LIKE ? OR m.subject_fld LIKE ?)"
+            f"(m.{s.from_col} LIKE ? OR m.{s.to_col} LIKE ? OR m.{s.subject_col} LIKE ?)"
         )
         like_val = f"%{query}%"
         params.extend([like_val, like_val, like_val])
 
     if from_filter:
-        conditions.append("m.from_fld LIKE ?")
+        conditions.append(f"m.{s.from_col} LIKE ?")
         params.append(f"%{from_filter}%")
 
     if to_filter:
-        conditions.append("m.to_fld LIKE ?")
+        conditions.append(f"m.{s.to_col} LIKE ?")
         params.append(f"%{to_filter}%")
 
     if subject_filter:
-        conditions.append("m.subject_fld LIKE ?")
+        conditions.append(f"m.{s.subject_col} LIKE ?")
         params.append(f"%{subject_filter}%")
 
     if body_filter:
-        conditions.append("m.body_fld LIKE ?")
+        conditions.append(f"m.{s.body_col} LIKE ?")
         params.append(f"%{body_filter}%")
 
     if date_from:
-        conditions.append("m.datesent_fld >= ?")
+        conditions.append(f"m.{s.date_col} >= ?")
         params.append(date_from)
 
     if date_to:
-        conditions.append("m.datesent_fld <= ?")
+        conditions.append(f"m.{s.date_col} <= ?")
         params.append(date_to)
 
-    if has_attachments is True:
+    if has_attachments is True and s.attach_table:
         from_clause += (
-            f" INNER JOIN attachdata a ON a.message_id = m.{id_col}"
+            f" INNER JOIN {s.attach_table} a ON a.{s.attach_fk_col} = m.{s.id_col}"
         )
-    elif has_attachments is False:
+    elif has_attachments is False and s.attach_table:
         conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM attachdata a WHERE a.message_id = m.{id_col})"
+            f"NOT EXISTS (SELECT 1 FROM {s.attach_table} a "
+            f"WHERE a.{s.attach_fk_col} = m.{s.id_col})"
         )
 
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    # Deduplizieren falls JOIN auf attachdata mehrere Zeilen erzeugt
-    group_by = f" GROUP BY m.{id_col}" if has_attachments is True else ""
+    # Deduplizieren falls JOIN auf attachments mehrere Zeilen erzeugt
+    group_by = f" GROUP BY m.{s.id_col}" if has_attachments is True else ""
 
-    sql = f"{select}{from_clause}{where}{group_by} ORDER BY m.datesent_fld DESC LIMIT ?"
+    sql = f"{select}{from_clause}{where}{group_by} ORDER BY m.{s.date_col} DESC LIMIT ?"
     params.append(str(limit))
 
     rows = conn.execute(sql, params).fetchall()
@@ -202,26 +336,26 @@ def search_emails(
     # Attachment-Check: sammle alle IDs fuer Batch-Lookup
     ids = [row["id"] for row in rows]
     attach_ids: set[int] = set()
-    if ids:
+    if ids and s.attach_table:
         try:
             placeholders = ",".join("?" * len(ids))
             attach_rows = conn.execute(
-                f"SELECT DISTINCT message_id FROM attachdata WHERE message_id IN ({placeholders})",
+                f"SELECT DISTINCT {s.attach_fk_col} FROM {s.attach_table} "
+                f"WHERE {s.attach_fk_col} IN ({placeholders})",
                 ids,
             ).fetchall()
-            attach_ids = {r["message_id"] for r in attach_rows}
+            attach_ids = {r[0] for r in attach_rows}
         except sqlite3.OperationalError:
-            # attachdata-Tabelle existiert nicht
             pass
 
     return [
         EmailResult(
             id=row["id"],
-            from_=row["from_fld"] or "",
-            to=row["to_fld"] or "",
-            subject=row["subject_fld"] or "",
-            date=row["datesent_fld"] or "",
-            mailbox=row["mailbox_fld"] or "",
+            from_=row[s.from_col] or "",
+            to=row[s.to_col] or "",
+            subject=row[s.subject_col] or "",
+            date=row[s.date_col] or "",
+            mailbox=row[s.mailbox_col] or "",
             has_attachments=row["id"] in attach_ids,
         )
         for row in rows
@@ -229,24 +363,24 @@ def search_emails(
 
 
 def get_email(
-    conn: sqlite3.Connection, schema: str, email_id: int
+    conn: sqlite3.Connection, schema: SchemaMapping, email_id: int
 ) -> EmailDetail | None:
     """Holt eine vollstaendige Email mit Body.
 
     Args:
         conn: Offene Datenbankverbindung
-        schema: Schema-Typ ('modern' oder 'legacy')
+        schema: Schema-Mapping
         email_id: ID der Email
 
     Returns:
         EmailDetail oder None wenn nicht gefunden
     """
-    id_col = "emailid" if schema == "modern" else "rowid"
+    s = schema
 
     row = conn.execute(
-        f"SELECT {id_col} AS id, from_fld, to_fld, subject_fld, "
-        "datesent_fld, body_fld, mailbox_fld, cc_fld, bcc_fld "
-        f"FROM mail WHERE {id_col} = ?",
+        f"SELECT {s.id_col} AS id, {s.from_col}, {s.to_col}, {s.subject_col}, "
+        f"{s.date_col}, {s.body_col}, {s.mailbox_col} "
+        f"FROM {s.table} WHERE {s.id_col} = ?",
         (email_id,),
     ).fetchone()
 
@@ -255,56 +389,57 @@ def get_email(
 
     # Attachment-Check
     has_attachments = False
-    try:
-        attach_row = conn.execute(
-            "SELECT 1 FROM attachdata WHERE message_id = ? LIMIT 1",
-            (email_id,),
-        ).fetchone()
-        has_attachments = attach_row is not None
-    except sqlite3.OperationalError:
-        pass
+    if s.attach_table:
+        try:
+            attach_row = conn.execute(
+                f"SELECT 1 FROM {s.attach_table} WHERE {s.attach_fk_col} = ? LIMIT 1",
+                (email_id,),
+            ).fetchone()
+            has_attachments = attach_row is not None
+        except sqlite3.OperationalError:
+            pass
 
     return EmailDetail(
         id=row["id"],
-        from_=row["from_fld"] or "",
-        to=row["to_fld"] or "",
-        subject=row["subject_fld"] or "",
-        date=row["datesent_fld"] or "",
-        mailbox=row["mailbox_fld"] or "",
+        from_=row[s.from_col] or "",
+        to=row[s.to_col] or "",
+        subject=row[s.subject_col] or "",
+        date=row[s.date_col] or "",
+        mailbox=row[s.mailbox_col] or "",
         has_attachments=has_attachments,
-        body=row["body_fld"] or "",
-        cc=row["cc_fld"] or "",
-        bcc=row["bcc_fld"] or "",
+        body=row[s.body_col] or "",
     )
 
 
-def get_stats(conn: sqlite3.Connection, schema: str) -> DatabaseStats:
+def get_stats(conn: sqlite3.Connection, schema: SchemaMapping) -> DatabaseStats:
     """Berechnet Statistiken fuer eine MailSteward-Datenbank.
 
     Args:
         conn: Offene Datenbankverbindung
-        schema: Schema-Typ ('modern' oder 'legacy')
+        schema: Schema-Mapping
 
     Returns:
         DatabaseStats mit Mailbox-, Sender- und Datumsverteilung
     """
+    s = schema
+
     mailbox_counts: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT mailbox_fld, COUNT(*) AS cnt FROM mail GROUP BY mailbox_fld"
+        f"SELECT {s.mailbox_col}, COUNT(*) AS cnt FROM {s.table} GROUP BY {s.mailbox_col}"
     ):
-        mailbox_counts[row["mailbox_fld"] or "(empty)"] = row["cnt"]
+        mailbox_counts[row[0] or "(empty)"] = row["cnt"]
 
     sender_counts: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT from_fld, COUNT(*) AS cnt FROM mail "
-        "GROUP BY from_fld ORDER BY cnt DESC LIMIT 20"
+        f"SELECT {s.from_col}, COUNT(*) AS cnt FROM {s.table} "
+        f"GROUP BY {s.from_col} ORDER BY cnt DESC LIMIT 20"
     ):
-        sender_counts[row["from_fld"] or "(empty)"] = row["cnt"]
+        sender_counts[row[0] or "(empty)"] = row["cnt"]
 
     date_distribution: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT strftime('%Y-%m', datesent_fld) AS period, COUNT(*) AS cnt "
-        "FROM mail GROUP BY period"
+        f"SELECT strftime('%Y-%m', {s.date_col}) AS period, COUNT(*) AS cnt "
+        f"FROM {s.table} GROUP BY period"
     ):
         date_distribution[row["period"] or "(unknown)"] = row["cnt"]
 
