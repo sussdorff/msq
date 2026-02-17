@@ -102,6 +102,16 @@ class DatabaseInfo:
 
 
 @dataclass
+class ExportStats:
+    """Statistiken eines EML-Exports."""
+
+    total: int = 0
+    exported: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+
+@dataclass
 class DatabaseStats:
     """Statistiken ueber eine MailSteward-Datenbank."""
 

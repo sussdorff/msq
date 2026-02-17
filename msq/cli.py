@@ -3,11 +3,21 @@
 from pathlib import Path
 
 import typer
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
 
 from msq import __version__
 from msq.attachments import extract_attachment, list_attachments
 from msq.config import load_config, resolve_db
-from msq.db import detect_schema, discover_databases, get_email, get_stats, open_db, search_emails
+from msq.db import (
+    count_emails,
+    detect_schema,
+    discover_databases,
+    get_email,
+    get_stats,
+    open_db,
+    search_emails,
+)
+from msq.export import export_database
 from msq.output import (
     OutputFormat,
     output_attachments,
@@ -231,3 +241,86 @@ def stats(
         conn.close()
 
     output_stats(db_stats)
+
+
+@app.command("eml-export")
+def eml_export(
+    db_name: str | None = typer.Argument(None, help="Database name or alias."),
+    all_dbs: bool = typer.Option(False, "--all", help="Export all databases."),
+    output_dir: Path = typer.Option(..., "--output", "-o", help="Output directory."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only show statistics, no export."),
+) -> None:
+    """Export emails as EML files."""
+    if not db_name and not all_dbs:
+        print_error("Specify a database name or use --all.")
+        raise typer.Exit(1)
+
+    config = load_config()
+
+    if all_dbs:
+        databases = discover_databases(config.db_dir)
+        if not databases:
+            print_info("No databases found.")
+            raise typer.Exit()
+        db_list = [(db.name, db.path) for db in databases]
+    else:
+        db_path = resolve_db(config, db_name)
+        if db_path is None:
+            print_error(f"Database not found: {db_name}")
+            raise typer.Exit(1)
+        db_list = [(db_name, db_path)]
+
+    total_exported = 0
+    total_errors = 0
+
+    for name, path in db_list:
+        conn = open_db(path)
+        try:
+            schema = detect_schema(conn)
+            email_count = count_emails(conn, schema)
+
+            if email_count == 0:
+                print_info(f"{name}: No emails, skipping.")
+                continue
+
+            action = "Scanning" if dry_run else "Exporting"
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                transient=True,
+            ) as progress:
+                task = progress.add_task(f"{action} {name}...", total=email_count)
+
+                def advance(_task=task, _progress=progress):
+                    _progress.advance(_task)
+
+                stats = export_database(
+                    conn, schema, output_dir, name,
+                    dry_run=dry_run,
+                    progress_callback=advance,
+                )
+
+            total_exported += stats.exported
+            total_errors += stats.errors
+
+            status = f"{stats.exported} emails"
+            if stats.errors:
+                status += f", {stats.errors} errors"
+            if dry_run:
+                print_info(f"{name}: {status} (dry-run)")
+            else:
+                print_success(f"{name}: {status}")
+        finally:
+            conn.close()
+
+    if dry_run:
+        n_dbs = len(db_list)
+        print_info(f"\nDry-run complete: {total_exported} emails across {n_dbs} database(s).")
+    else:
+        msg = f"\nExport complete: {total_exported} emails"
+        if total_errors:
+            msg += f", {total_errors} errors"
+        print_success(msg)

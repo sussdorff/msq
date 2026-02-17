@@ -1,6 +1,7 @@
 """Datenbankzugriff fuer MailSteward SQLite-Archive."""
 
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,7 @@ class SchemaMapping:
     attach_filename_col: str
     attach_data_col: str
     attach_size_col: str | None
+    headings_col: str | None
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -138,6 +140,9 @@ def detect_schema(conn: sqlite3.Connection) -> SchemaMapping:
         elif "filesize" in attach_cols:
             attach_size_col = "filesize"
 
+    # Headings-Spalte (Original-RFC822-Header)
+    headings_col = "headings" if "headings" in cols else None
+
     return SchemaMapping(
         table=email_table,
         id_col=id_col,
@@ -152,6 +157,7 @@ def detect_schema(conn: sqlite3.Connection) -> SchemaMapping:
         attach_filename_col=attach_filename_col,
         attach_data_col=attach_data_col,
         attach_size_col=attach_size_col,
+        headings_col=headings_col,
     )
 
 
@@ -448,3 +454,39 @@ def get_stats(conn: sqlite3.Connection, schema: SchemaMapping) -> DatabaseStats:
         sender_counts=sender_counts,
         date_distribution=date_distribution,
     )
+
+
+def count_emails(conn: sqlite3.Connection, schema: SchemaMapping) -> int:
+    """Zaehlt die Anzahl der Emails in einer Datenbank."""
+    row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {schema.table}").fetchone()
+    return row["cnt"] if row else 0
+
+
+def iter_emails_for_export(
+    conn: sqlite3.Connection, schema: SchemaMapping
+) -> Iterator[sqlite3.Row]:
+    """Iteriert ueber alle Emails fuer den EML-Export.
+
+    Yieldet pro Email eine Row mit id, headings, body_fld, mailbox, date, subject.
+    Memory-effizient via Cursor (kein fetchall).
+
+    Args:
+        conn: Offene Datenbankverbindung
+        schema: Schema-Mapping
+
+    Yields:
+        sqlite3.Row mit den Export-relevanten Spalten
+    """
+    s = schema
+    headings_select = f", {s.headings_col}" if s.headings_col else ", '' AS headings"
+
+    sql = (
+        f"SELECT {s.id_col} AS id, {s.body_col} AS body_fld, "
+        f"{s.mailbox_col} AS mailbox, {s.date_col} AS date_fld, "
+        f"{s.subject_col} AS subject_fld"
+        f"{headings_select} "
+        f"FROM {s.table} ORDER BY {s.id_col}"
+    )
+
+    cursor = conn.execute(sql)
+    yield from cursor
